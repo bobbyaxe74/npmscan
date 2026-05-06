@@ -53,106 +53,52 @@ export async function POST(req: NextRequest) {
     // Navigate to npmscan.com/analyze
     await page.goto(NPMSCAN_URL, { waitUntil: "networkidle2", timeout: 30_000 });
 
-    // Find the textarea and paste the package.json content
-    // npmscan.com/analyze has a textarea for the package.json content
-    const textareaSelector = "textarea";
-    await page.waitForSelector(textareaSelector, { timeout: 15_000 });
+    // Wait for the textarea
+    await page.waitForSelector("textarea", { timeout: 15_000 });
 
-    // Use evaluate to set the textarea value directly (faster than typing)
-    await page.evaluate(
-      (selector: string, content: string) => {
-        const el = document.querySelector(selector) as HTMLTextAreaElement | null;
-        if (el) {
-          el.value = content;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-      },
-      textareaSelector,
-      packageContent
-    );
-
-    // Find and click the submit/analyze button
-    // Try common selectors for the submit button
-    const buttonSelectors = [
-      'button[type="submit"]',
-      'input[type="submit"]',
-      'button.analyze',
-      'button.submit',
-    ];
-
-    let buttonClicked = false;
-    for (const sel of buttonSelectors) {
-      try {
-        const btn = await page.$(sel);
-        if (btn) {
-          await btn.click();
-          buttonClicked = true;
-          break;
-        }
-      } catch {
-        // try next selector
+    // npmscan.com is a React app — must use the native input value setter
+    // to trigger React's synthetic event system, otherwise state won't update
+    await page.evaluate((content: string) => {
+      const textarea = document.querySelector("textarea") as HTMLTextAreaElement | null;
+      if (!textarea) throw new Error("Textarea not found");
+      // Trigger React's internal setter
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value"
+      )?.set;
+      if (nativeSetter) {
+        nativeSetter.call(textarea, content);
+      } else {
+        textarea.value = content;
       }
-    }
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      textarea.dispatchEvent(new Event("change", { bubbles: true }));
+    }, packageContent);
 
-    // If no specific button found, try clicking any button whose text matches
-    if (!buttonClicked) {
-      await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll("button"));
-        const analyzeBtn = buttons.find(
-          (b) =>
-            b.textContent?.toLowerCase().includes("SCAN FOR VULNERABILITIES") ||
-            b.textContent?.toLowerCase().includes("analyz") ||
-            b.textContent?.toLowerCase().includes("scan") ||
-            b.textContent?.toLowerCase().includes("submit") ||
-            b.textContent?.toLowerCase().includes("check")
-        );
-        if (analyzeBtn) {
-          (analyzeBtn as HTMLButtonElement).click();
-        } else if (buttons.length > 0) {
-          (buttons[0] as HTMLButtonElement).click();
-        }
-      });
-    }
-
-    // Wait for results to appear - poll until results exist or URL changes
-    const startTime = Date.now();
-
-    await new Promise<void>((resolve, reject) => {
-      const interval = setInterval(async () => {
-        try {
-          if (Date.now() - startTime > ANALYSIS_TIMEOUT_MS) {
-            clearInterval(interval);
-            reject(new Error("Analysis timed out waiting for results"));
-            return;
-          }
-
-          const currentUrl = page.url();
-          // npmscan.com redirects to a results page or updates the DOM with results
-          const hasResults = await page.evaluate(() => {
-            const resultSelectors = [
-              ".results",
-              ".vulnerabilities",
-              ".packages",
-              "[data-results]",
-              ".scan-results",
-              ".report",
-              "table",
-              ".summary",
-            ];
-            return resultSelectors.some((sel) => document.querySelector(sel) !== null);
-          });
-
-          if (hasResults || currentUrl !== NPMSCAN_URL) {
-            clearInterval(interval);
-            resolve();
-          }
-        } catch (err) {
-          clearInterval(interval);
-          reject(err);
-        }
-      }, 750);
+    // Click the "SCAN FOR VULNERABILITIES" button by matching button text
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const btn = buttons.find((b) =>
+        b.textContent?.toUpperCase().includes("SCAN")
+      ) ?? buttons[0];
+      if (btn) (btn as HTMLButtonElement).click();
     });
+
+    // Wait for results — detect when the placeholder text disappears
+    // and new result content appears (URL may change or DOM updates in place)
+    const initialUrl = page.url();
+    await page.waitForFunction(
+      (startUrl: string) => {
+        // Either the URL changed (redirect to results page)
+        if (window.location.href !== startUrl) return true;
+        // Or the placeholder "PASTE PACKAGE.JSON TO BEGIN ANALYSIS" is gone
+        const bodyText = document.body.innerText ?? "";
+        if (!bodyText.includes("PASTE PACKAGE.JSON TO BEGIN ANALYSIS")) return true;
+        return false;
+      },
+      { timeout: ANALYSIS_TIMEOUT_MS, polling: 750 },
+      initialUrl
+    );
 
     // Extract meaningful results from the page
     const results = await page.evaluate((minContentLength: number) => {
