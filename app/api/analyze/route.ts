@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import chromium from "@sparticuz/chromium";
-import puppeteer from "puppeteer-core";
+import puppeteer, { type Browser } from "puppeteer-core";
 
 const NPMSCAN_URL = "https://npmscan.com/analyze";
 // Allow up to 60 seconds for the analysis to complete
 const ANALYSIS_TIMEOUT_MS = 60_000;
+// Minimum content length to consider result text substantial
+const MIN_CONTENT_LENGTH = 50;
 
 export const maxDuration = 60;
 
@@ -29,7 +31,7 @@ export async function POST(req: NextRequest) {
 
   const packageContent = JSON.stringify(packageJson, null, 2);
 
-  let browser = null;
+  let browser: Browser | null = null;
 
   try {
     const executablePath = await chromium.executablePath();
@@ -142,11 +144,11 @@ export async function POST(req: NextRequest) {
           clearInterval(interval);
           reject(err);
         }
-      }, 1500);
+      }, 750);
     });
 
     // Extract meaningful results from the page
-    const results = await page.evaluate(() => {
+    const results = await page.evaluate((minContentLength: number) => {
       const getText = (sel: string) =>
         Array.from(document.querySelectorAll(sel)).map((el) => el.textContent?.trim() ?? "");
 
@@ -170,12 +172,12 @@ export async function POST(req: NextRequest) {
         const el = document.querySelector(sel);
         if (el) {
           rawContent = el.textContent?.trim() ?? "";
-          if (rawContent.length > 50) break;
+          if (rawContent.length > minContentLength) break;
         }
       }
 
       // Also gather all visible text from the body as fallback
-      if (!rawContent || rawContent.length < 50) {
+      if (!rawContent || rawContent.length < minContentLength) {
         rawContent = document.body.textContent?.trim() ?? "";
       }
 
@@ -186,7 +188,7 @@ export async function POST(req: NextRequest) {
         tables: getText("table"),
         headings: getText("h1, h2, h3"),
       };
-    });
+    }, MIN_CONTENT_LENGTH);
 
     return NextResponse.json({
       success: true,
