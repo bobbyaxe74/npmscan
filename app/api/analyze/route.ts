@@ -6,8 +6,6 @@ const NPMSCAN_URL = "https://npmscan.com/analyze";
 const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 // Allow up to 60 seconds for the analysis to complete
 const ANALYSIS_TIMEOUT_MS = 60_000;
-// Minimum content length to consider result text substantial
-const MIN_CONTENT_LENGTH = 50;
 
 export const maxDuration = 60;
 
@@ -100,56 +98,101 @@ export async function POST(req: NextRequest) {
       initialUrl
     );
 
-    // Extract meaningful results from the page
-    const results = await page.evaluate((minContentLength: number) => {
-      const getText = (sel: string) =>
-        Array.from(document.querySelectorAll(sel)).map((el) => el.textContent?.trim() ?? "");
+    // Wait a moment for any final renders
+    await new Promise((r) => setTimeout(r, 500));
 
-      // Capture raw text content from common result containers
-      const resultContainers = [
-        ".results",
-        ".vulnerabilities",
-        ".packages",
-        ".scan-results",
-        ".report",
-        ".summary",
-        "table",
-        "main",
-        "#main",
-        "#content",
-        ".content",
-      ];
+    // Extract structured scan results from the DOM
+    const results = await page.evaluate(() => {
+      const text = (el: Element | null) => el?.textContent?.trim() ?? "";
 
-      let rawContent = "";
-      for (const sel of resultContainers) {
-        const el = document.querySelector(sel);
-        if (el) {
-          rawContent = el.textContent?.trim() ?? "";
-          if (rawContent.length > minContentLength) break;
+      // --- Summary stats ---
+      // The page shows e.g. "11", "TOTAL PACKAGES", "0", "VULNERABILITIES", "0", "OUTDATED PACKAGES"
+      // These appear as sibling number+label pairs. We grab all number-like spans and their labels.
+      const statNumbers = Array.from(document.querySelectorAll("*")).filter((el) => {
+        const t = el.textContent?.trim() ?? "";
+        return (
+          el.children.length === 0 &&
+          /^\d+$/.test(t) &&
+          parseInt(t) <= 10000
+        );
+      });
+
+      const summary: Record<string, number> = {};
+      statNumbers.forEach((numEl) => {
+        const sibling = numEl.nextElementSibling ?? numEl.parentElement?.nextElementSibling;
+        const label = sibling?.textContent?.trim().toUpperCase() ?? "";
+        if (label.includes("TOTAL")) summary.totalPackages = parseInt(numEl.textContent!);
+        if (label.includes("VULNERABILIT")) summary.vulnerabilities = parseInt(numEl.textContent!);
+        if (label.includes("OUTDATED")) summary.outdatedPackages = parseInt(numEl.textContent!);
+      });
+
+      // --- Overall status (e.g. "ALL CLEAR" or "VULNERABILITIES FOUND") ---
+      const bodyText = document.body.innerText;
+      let overallStatus = "UNKNOWN";
+      if (bodyText.includes("ALL CLEAR")) overallStatus = "ALL CLEAR";
+      else if (/VULNERABILIT(Y|IES) FOUND/i.test(bodyText)) overallStatus = "VULNERABILITIES FOUND";
+      else if (/HIGH RISK/i.test(bodyText)) overallStatus = "HIGH RISK";
+
+      // --- Per-package results ---
+      // Each package row contains the name, version, and a status badge (SAFE / VULNERABLE etc.)
+      // We detect by looking for elements whose text matches a semver-like version
+      const packages: Array<{
+        name: string;
+        version: string;
+        status: string;
+        details: string;
+      }> = [];
+
+      // Walk all elements looking for a pattern: package-name block, version block, status block
+      const allEls = Array.from(document.querySelectorAll("*"));
+      allEls.forEach((el) => {
+        if (el.children.length > 0) return;
+        const t = el.textContent?.trim() ?? "";
+        // Match semver versions like 1.2.3, 16.2.4, 148.0.0
+        if (!/^\d+\.\d+(\.\d+)?(-\S+)?$/.test(t)) return;
+        const version = t;
+
+        // Name is likely in the previous sibling or parent's previous sibling
+        let nameEl: Element | null = el.previousElementSibling;
+        if (!nameEl) nameEl = el.parentElement?.previousElementSibling ?? null;
+        const name = text(nameEl);
+
+        // Status is likely in the next sibling; may contain both badge + detail text
+        let statusEl: Element | null = el.nextElementSibling;
+        if (!statusEl) statusEl = el.parentElement?.nextElementSibling ?? null;
+        const statusFull = text(statusEl);
+
+        // Split e.g. "SAFENO KNOWN VULNERABILITIES" → status: "SAFE", details: "NO KNOWN VULNERABILITIES"
+        const statusMatch = statusFull.match(/^(SAFE|VULNERABLE|CRITICAL|HIGH|MEDIUM|LOW|OUTDATED|UNKNOWN)/i);
+        const status = statusMatch ? statusMatch[1].toUpperCase() : statusFull;
+        const details = statusMatch ? statusFull.slice(statusMatch[1].length).trim() : "";
+
+        if (name && version && status) {
+          packages.push({ name, version, status, details });
         }
-      }
+      });
 
-      // Also gather all visible text from the body as fallback
-      if (!rawContent || rawContent.length < minContentLength) {
-        rawContent = document.body.textContent?.trim() ?? "";
-      }
+      // Deduplicate by name+version
+      const seen = new Set<string>();
+      const uniquePackages = packages.filter(({ name, version }) => {
+        const key = `${name}@${version}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
       return {
-        url: window.location.href,
-        title: document.title,
-        content: rawContent,
-        tables: getText("table"),
-        headings: getText("h1, h2, h3"),
+        overallStatus,
+        summary,
+        packages: uniquePackages,
       };
-    }, MIN_CONTENT_LENGTH);
+    });
 
     return NextResponse.json({
       success: true,
-      analysisUrl: results.url,
-      title: results.title,
-      results: results.content,
-      headings: results.headings,
-      tables: results.tables,
+      overallStatus: results.overallStatus,
+      summary: results.summary,
+      packages: results.packages,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -164,3 +207,4 @@ export async function POST(req: NextRequest) {
     }
   }
 }
+
