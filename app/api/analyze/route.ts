@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import chromium from "@sparticuz/chromium";
-import puppeteer, { type Browser } from "puppeteer-core";
+import { type Browser } from "puppeteer-core";
 
 const NPMSCAN_URL = "https://npmscan.com/analyze";
+// Use the serverless Chromium only when actually deployed (e.g. Vercel / AWS Lambda)
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 // Allow up to 60 seconds for the analysis to complete
 const ANALYSIS_TIMEOUT_MS = 60_000;
 // Minimum content length to consider result text substantial
@@ -34,13 +35,18 @@ export async function POST(req: NextRequest) {
   let browser: Browser | null = null;
 
   try {
-    const executablePath = await chromium.executablePath();
-
-    browser = await puppeteer.launch({
-      args: chromium.args,
-      executablePath,
-      headless: true,
-    });
+    if (IS_SERVERLESS) {
+      const chromium = await import("@sparticuz/chromium").then((m) => m.default);
+      const puppeteerCore = await import("puppeteer-core").then((m) => m.default);
+      browser = await puppeteerCore.launch({
+        args: chromium.args,
+        executablePath: await chromium.executablePath(),
+        headless: true,
+      });
+    } else {
+      const puppeteer = await import("puppeteer").then((m) => m.default);
+      browser = await puppeteer.launch({ headless: true });
+    }
 
     const page = await browser.newPage();
 
@@ -95,6 +101,7 @@ export async function POST(req: NextRequest) {
         const buttons = Array.from(document.querySelectorAll("button"));
         const analyzeBtn = buttons.find(
           (b) =>
+            b.textContent?.toLowerCase().includes("SCAN FOR VULNERABILITIES") ||
             b.textContent?.toLowerCase().includes("analyz") ||
             b.textContent?.toLowerCase().includes("scan") ||
             b.textContent?.toLowerCase().includes("submit") ||
